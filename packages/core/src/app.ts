@@ -71,6 +71,13 @@ export interface Bindings {
   JWT_REFRESH_GRACE_SECONDS?: string
   BUCKET_NAME?: string
   GOOGLE_MAPS_API_KEY?: string
+  /**
+   * Optional base URL for serving media. When set, a media item's `public_url`
+   * is built as `${MEDIA_PUBLIC_BASE}/${r2_key}` instead of the default
+   * `https://pub-${BUCKET_NAME}.r2.dev/${r2_key}`. Use this to serve media from
+   * a custom domain, CDN, or a Worker route while keeping the R2 bucket private.
+   */
+  MEDIA_PUBLIC_BASE?: string
 }
 
 export interface Variables {

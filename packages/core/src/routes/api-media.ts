@@ -8,6 +8,23 @@ function generateId(): string {
   return crypto.randomUUID().replace(/-/g, '').substring(0, 21)
 }
 
+/**
+ * Build the public URL for a stored media object.
+ *
+ * Default: the bucket's r2.dev development URL (`https://pub-<BUCKET_NAME>.r2.dev/<key>`).
+ * Set the `MEDIA_PUBLIC_BASE` binding to serve media from a custom domain, CDN,
+ * or a Worker route instead — the `r2_key` is appended to that base. This lets
+ * the R2 bucket stay private (served through your own endpoint) while the admin
+ * UI and published content still get a working image URL. Backward compatible:
+ * when `MEDIA_PUBLIC_BASE` is unset the r2.dev URL is used as before.
+ */
+export function buildMediaPublicUrl(env: Bindings, r2Key: string): string {
+  const base = env.MEDIA_PUBLIC_BASE?.trim()
+  if (base) return `${base.replace(/\/+$/, '')}/${r2Key}`
+  const bucketName = env.BUCKET_NAME || 'sonicjs-media-dev'
+  return `https://pub-${bucketName}.r2.dev/${r2Key}`
+}
+
 // Helper function for emitting events (simplified for core package)
 async function emitEvent(eventName: string, data: any) {
   console.log(`[Event] ${eventName}:`, data)
@@ -94,10 +111,9 @@ apiMediaRoutes.post('/upload', async (c) => {
       return c.json({ error: 'Failed to upload file to storage' }, 500)
     }
 
-    // Generate public URL using environment variable for bucket name
-    const bucketName = c.env.BUCKET_NAME || 'sonicjs-media-dev'
-    const publicUrl = `https://pub-${bucketName}.r2.dev/${r2Key}`
-    
+    // Generate public URL (r2.dev by default; MEDIA_PUBLIC_BASE override)
+    const publicUrl = buildMediaPublicUrl(c.env, r2Key)
+
     // Extract image dimensions if it's an image
     let width: number | null = null
     let height: number | null = null
@@ -253,10 +269,9 @@ apiMediaRoutes.post('/upload-multiple', async (c) => {
           continue
         }
 
-        // Generate public URL using environment variable for bucket name
-        const bucketName = c.env.BUCKET_NAME || 'sonicjs-media-dev'
-        const publicUrl = `https://pub-${bucketName}.r2.dev/${r2Key}`
-        
+        // Generate public URL (r2.dev by default; MEDIA_PUBLIC_BASE override)
+        const publicUrl = buildMediaPublicUrl(c.env, r2Key)
+
         // Extract image dimensions if it's an image
         let width: number | null = null
         let height: number | null = null
@@ -582,8 +597,7 @@ apiMediaRoutes.post('/bulk-move', async (c) => {
         }
 
         // Update database with new folder and R2 key
-        const bucketName = c.env.BUCKET_NAME || 'sonicjs-media-dev'
-        const newPublicUrl = `https://pub-${bucketName}.r2.dev/${newR2Key}`
+        const newPublicUrl = buildMediaPublicUrl(c.env, newR2Key)
 
         const updateStmt = c.env.DB.prepare(`
           UPDATE media
