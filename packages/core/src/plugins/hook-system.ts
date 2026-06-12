@@ -4,11 +4,19 @@
  * Provides event-driven extensibility for plugins
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { HookSystem, HookHandler, PluginHook, HookContext } from '../types'
+
+// Recursion guard scoped to the current async execution chain. Using
+// AsyncLocalStorage (instead of a shared instance Set) means concurrent requests
+// don't collide on the same flag, and an abandoned or slow handler can't wedge a
+// hook for the isolate's lifetime — both real hazards now that hooks fire
+// per-request in a Cloudflare Worker. Detects true re-entrancy (a hook handler
+// re-triggering the same hook within its own call chain) only.
+const hookExecutionStack = new AsyncLocalStorage<Set<string>>()
 
 export class HookSystemImpl implements HookSystem {
   private hooks: Map<string, PluginHook[]> = new Map()
-  private executing: Set<string> = new Set()
 
   /**
    * Register a hook handler
@@ -45,15 +53,17 @@ export class HookSystemImpl implements HookSystem {
       return data
     }
 
-    // Prevent infinite recursion
-    if (this.executing.has(hookName)) {
+    // Prevent infinite recursion — only within the SAME async execution chain.
+    const stack = hookExecutionStack.getStore()
+    if (stack?.has(hookName)) {
       console.warn(`Hook recursion detected for: ${hookName}`)
       return data
     }
 
-    this.executing.add(hookName)
+    const nextStack = new Set(stack)
+    nextStack.add(hookName)
 
-    try {
+    return hookExecutionStack.run(nextStack, async () => {
       let result = data
       let cancelled = false
 
@@ -82,9 +92,7 @@ export class HookSystemImpl implements HookSystem {
       }
 
       return result
-    } finally {
-      this.executing.delete(hookName)
-    }
+    })
   }
 
   /**
@@ -135,7 +143,8 @@ export class HookSystemImpl implements HookSystem {
    */
   clear(): void {
     this.hooks.clear()
-    this.executing.clear()
+    // No persistent execution state to clear — recursion is tracked per async
+    // execution chain via AsyncLocalStorage.
   }
 
   /**
