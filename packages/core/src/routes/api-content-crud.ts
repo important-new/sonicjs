@@ -1,8 +1,24 @@
 import { Hono } from 'hono'
 import { requireAuth, requireRole } from '../middleware'
 import { getCacheService, CACHE_CONFIGS } from '../services'
+import { runHook } from '../plugins/core-hooks'
+import { HOOKS } from '../types'
 import type { Bindings, Variables } from '../app'
 import { resolveContentVariables } from '../plugins/core-plugins/global-variables-plugin/variable-resolver'
+
+/** Normalize a raw `content` DB row into the hook payload shape. */
+function toHookRecord(row: any) {
+  return {
+    id: row.id,
+    collectionId: row.collection_id,
+    title: row.title,
+    slug: row.slug,
+    status: row.status,
+    data: row.data ? JSON.parse(row.data) : {},
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }
+}
 
 const apiContentCrudRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>()
 
@@ -128,6 +144,18 @@ apiContentCrudRoutes.post('/', requireAuth(), requireRole(['admin', 'editor', 'a
     const contentId = crypto.randomUUID()
     const now = Date.now()
 
+    // content:save hook (before write) — handlers may mutate fields, e.g. derive
+    // a value such as an OG image and write it back into `data` before insert.
+    const saved = await runHook(HOOKS.CONTENT_SAVE, {
+      id: contentId,
+      collectionId,
+      title,
+      slug: finalSlug,
+      status: status || 'draft',
+      data: data || {},
+      operation: 'create' as const,
+    }, { env: c.env, user })
+
     const insertStmt = db.prepare(`
       INSERT INTO content (
         id, collection_id, slug, title, data, status,
@@ -138,11 +166,11 @@ apiContentCrudRoutes.post('/', requireAuth(), requireRole(['admin', 'editor', 'a
 
     await insertStmt.bind(
       contentId,
-      collectionId,
-      finalSlug,
-      title,
-      JSON.stringify(data || {}),
-      status || 'draft',
+      saved.collectionId ?? collectionId,
+      saved.slug ?? finalSlug,
+      saved.title ?? title,
+      JSON.stringify(saved.data ?? {}),
+      saved.status ?? 'draft',
       user?.userId || 'system',
       now,
       now
@@ -156,6 +184,9 @@ apiContentCrudRoutes.post('/', requireAuth(), requireRole(['admin', 'editor', 'a
     // Get the created content
     const getStmt = db.prepare('SELECT * FROM content WHERE id = ?')
     const createdContent = await getStmt.bind(contentId).first() as any
+
+    // content:create hook (after write) — notification with the saved record.
+    await runHook(HOOKS.CONTENT_CREATE, toHookRecord(createdContent), { env: c.env, user })
 
     return c.json({
       data: {
@@ -193,50 +224,38 @@ apiContentCrudRoutes.put('/:id', requireAuth(), requireRole(['admin', 'editor', 
       return c.json({ error: 'Content not found' }, 404)
     }
 
-    // Build update fields dynamically
-    const updates: string[] = []
-    const params: any[] = []
+    // Compute the next state (body fields override the existing row), then run
+    // the content:save hook (before write) so handlers may mutate fields — the
+    // returned values are what get persisted. Unprovided fields fall back to the
+    // existing row, so the result is equivalent to the previous partial update.
+    const slugify = (s: string) => s.toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').trim()
 
-    if (body.title !== undefined) {
-      updates.push('title = ?')
-      params.push(body.title)
-    }
-
-    if (body.slug !== undefined) {
-      let finalSlug = body.slug.toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, '')
-        .replace(/\s+/g, '-')
-        .replace(/-+/g, '-')
-        .trim()
-      updates.push('slug = ?')
-      params.push(finalSlug)
-    }
-
-    if (body.status !== undefined) {
-      updates.push('status = ?')
-      params.push(body.status)
-    }
-
-    if (body.data !== undefined) {
-      updates.push('data = ?')
-      params.push(JSON.stringify(body.data))
-    }
-
-    // Always update updated_at
-    const now = Date.now()
-    updates.push('updated_at = ?')
-    params.push(now)
-
-    // Add id to params for WHERE clause
-    params.push(id)
+    const saved = await runHook(HOOKS.CONTENT_SAVE, {
+      id,
+      collectionId: existing.collection_id,
+      title: body.title !== undefined ? body.title : existing.title,
+      slug: body.slug !== undefined ? slugify(body.slug) : existing.slug,
+      status: body.status !== undefined ? body.status : existing.status,
+      data: body.data !== undefined ? body.data : (existing.data ? JSON.parse(existing.data) : {}),
+      operation: 'update' as const,
+    }, { env: c.env, user: c.get('user') })
 
     // Execute update
+    const now = Date.now()
     const updateStmt = db.prepare(`
-      UPDATE content SET ${updates.join(', ')}
+      UPDATE content SET title = ?, slug = ?, status = ?, data = ?, updated_at = ?
       WHERE id = ?
     `)
 
-    await updateStmt.bind(...params).run()
+    await updateStmt.bind(
+      saved.title,
+      saved.slug,
+      saved.status,
+      JSON.stringify(saved.data ?? {}),
+      now,
+      id
+    ).run()
 
     // Invalidate cache
     const cache = getCacheService(CACHE_CONFIGS.api!)
@@ -247,6 +266,9 @@ apiContentCrudRoutes.put('/:id', requireAuth(), requireRole(['admin', 'editor', 
     // Get updated content
     const getStmt = db.prepare('SELECT * FROM content WHERE id = ?')
     const updatedContent = await getStmt.bind(id).first() as any
+
+    // content:update hook (after write) — notification with the saved record.
+    await runHook(HOOKS.CONTENT_UPDATE, toHookRecord(updatedContent), { env: c.env, user: c.get('user') })
 
     return c.json({
       data: {
@@ -276,12 +298,16 @@ apiContentCrudRoutes.delete('/:id', requireAuth(), requireRole(['admin', 'editor
     const db = c.env.DB
 
     // Check if content exists
-    const existingStmt = db.prepare('SELECT collection_id FROM content WHERE id = ?')
+    const existingStmt = db.prepare('SELECT * FROM content WHERE id = ?')
     const existing = await existingStmt.bind(id).first() as any
 
     if (!existing) {
       return c.json({ error: 'Content not found' }, 404)
     }
+
+    // content:delete hook (before delete) — handlers can clean up derived
+    // assets (e.g. a generated OG image in R2) using the record being removed.
+    await runHook(HOOKS.CONTENT_DELETE, toHookRecord(existing), { env: c.env, user: c.get('user') })
 
     // Delete the content (hard delete for API, soft delete happens in admin routes)
     const deleteStmt = db.prepare('DELETE FROM content WHERE id = ?')

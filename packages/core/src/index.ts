@@ -204,6 +204,12 @@ export type {
 
 export { HOOKS } from './types'
 
+// Core hook registry — register handlers for the content lifecycle hooks
+// (HOOKS.CONTENT_SAVE / CONTENT_CREATE / CONTENT_UPDATE / CONTENT_DELETE) that
+// the content routes now fire. `content:save` runs before create/update and its
+// return value is persisted, so handlers may mutate a record before it is saved.
+export { coreHooks, registerHook, runHook } from './plugins/core-hooks'
+
 // Utils - Week 1 (COMPLETED)
 export {
   // Sanitization

@@ -12,6 +12,8 @@ import { ContentListPageData, renderContentListPage } from '../templates/pages/a
 import { getBlocksFieldConfig, parseBlocksValue } from '../utils/blocks'
 import { escapeHtml, sanitizeRichText } from '../utils/sanitize'
 import { buildSchemaFieldOptions, resolveSchemaFieldType } from './admin-content-field-types'
+import { runHook } from '../plugins/core-hooks'
+import { HOOKS } from '../types'
 
 const adminContentRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>()
 
@@ -790,6 +792,19 @@ adminContentRoutes.post('/', async (c) => {
     const contentId = crypto.randomUUID()
     const now = Date.now()
 
+    // content:save hook (before write) — handlers may mutate fields, e.g. derive
+    // an OG image into `data` before the row (and its first version) are written.
+    const saved = await runHook(HOOKS.CONTENT_SAVE, {
+      id: contentId,
+      collectionId,
+      slug,
+      title: data.title || 'Untitled',
+      status,
+      data,
+      operation: 'create' as const,
+    }, { env: c.env, user })
+    const savedData = saved.data ?? data
+
     const insertStmt = db.prepare(`
       INSERT INTO content (
         id, collection_id, slug, title, data, status,
@@ -801,10 +816,10 @@ adminContentRoutes.post('/', async (c) => {
     await insertStmt.bind(
       contentId,
       collectionId,
-      slug,
-      data.title || 'Untitled',
-      JSON.stringify(data),
-      status,
+      saved.slug ?? slug,
+      saved.title ?? data.title ?? 'Untitled',
+      JSON.stringify(savedData),
+      saved.status ?? status,
       user?.userId || 'unknown',
       now,
       now
@@ -824,10 +839,22 @@ adminContentRoutes.post('/', async (c) => {
       crypto.randomUUID(),
       contentId,
       1,
-      JSON.stringify(data),
+      JSON.stringify(savedData),
       user?.userId || 'unknown',
       now
     ).run()
+
+    // content:create hook (after write) — notification with the saved record.
+    await runHook(HOOKS.CONTENT_CREATE, {
+      id: contentId,
+      collectionId,
+      slug: saved.slug ?? slug,
+      title: saved.title ?? data.title ?? 'Untitled',
+      status: saved.status ?? status,
+      data: savedData,
+      created_at: now,
+      updated_at: now,
+    }, { env: c.env, user })
 
     // Log workflow action
     const workflowStmt = db.prepare(`
@@ -953,6 +980,18 @@ adminContentRoutes.put('/:id', async (c) => {
     // Update content
     const now = Date.now()
 
+    // content:save hook (before write) — handlers may mutate fields.
+    const saved = await runHook(HOOKS.CONTENT_SAVE, {
+      id,
+      collectionId: existingContent.collection_id,
+      slug,
+      title: data.title || 'Untitled',
+      status,
+      data,
+      operation: 'update' as const,
+    }, { env: c.env, user })
+    const savedData = saved.data ?? data
+
     const updateStmt = db.prepare(`
       UPDATE content SET
         slug = ?, title = ?, data = ?, status = ?,
@@ -962,14 +1001,14 @@ adminContentRoutes.put('/:id', async (c) => {
     `)
 
     await updateStmt.bind(
-      slug,
-      data.title || 'Untitled',
-      JSON.stringify(data),
-      status,
+      saved.slug ?? slug,
+      saved.title ?? data.title ?? 'Untitled',
+      JSON.stringify(savedData),
+      saved.status ?? status,
       scheduledPublishAt ? new Date(scheduledPublishAt).getTime() : null,
       scheduledUnpublishAt ? new Date(scheduledUnpublishAt).getTime() : null,
-      data.meta_title || null,
-      data.meta_description || null,
+      savedData.meta_title || null,
+      savedData.meta_description || null,
       now,
       id
     ).run()
@@ -979,9 +1018,10 @@ adminContentRoutes.put('/:id', async (c) => {
     await cache.delete(cache.generateKey('content', id))
     await cache.invalidate(`content:list:${existingContent.collection_id}:*`)
 
-    // Create new version if content changed
+    // Create new version if content changed (compare against the saved data so a
+    // hook-derived field change is captured in the version history too)
     const existingData = JSON.parse(existingContent.data || '{}')
-    if (JSON.stringify(existingData) !== JSON.stringify(data)) {
+    if (JSON.stringify(existingData) !== JSON.stringify(savedData)) {
       // Get next version number
       const versionCountStmt = db.prepare('SELECT MAX(version) as max_version FROM content_versions WHERE content_id = ?')
       const versionResult = await versionCountStmt.bind(id).first() as any
@@ -996,11 +1036,22 @@ adminContentRoutes.put('/:id', async (c) => {
         crypto.randomUUID(),
         id,
         nextVersion,
-        JSON.stringify(data),
+        JSON.stringify(savedData),
         user?.userId || 'unknown',
         now
       ).run()
     }
+
+    // content:update hook (after write) — notification with the saved record.
+    await runHook(HOOKS.CONTENT_UPDATE, {
+      id,
+      collectionId: existingContent.collection_id,
+      slug: saved.slug ?? slug,
+      title: saved.title ?? data.title ?? 'Untitled',
+      status: saved.status ?? status,
+      data: savedData,
+      updated_at: now,
+    }, { env: c.env, user })
 
     // Log workflow action if status changed
     if (status !== existingContent.status) {
